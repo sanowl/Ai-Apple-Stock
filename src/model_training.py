@@ -1,12 +1,125 @@
-import pandas as pd
 import torch
+import numpy as np
+import pandas as pd
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import OneHotEncoder, LabelEncoder
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.downsample = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(out_channels)
+            )
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        residual = self.downsample(residual)
+        out += residual
+        out = self.relu(out)
+        return out
+
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_size, num_classes, dropout_rate=0.3):
+        super(NeuralNetwork, self).__init__()
+        self.input_size = input_size
+        self.num_classes = num_classes
+        self.dropout_rate = dropout_rate
+
+        # Initial convolutional layer
+        self.conv1 = nn.Conv1d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+
+        # Residual blocks
+        self.layer1 = self._make_layer(64, 64, blocks=2, stride=1)
+        self.layer2 = self._make_layer(64, 128, blocks=2, stride=2)
+        self.layer3 = self._make_layer(128, 256, blocks=2, stride=2)
+        self.layer4 = self._make_layer(256, 512, blocks=2, stride=2)
+
+        # Global average pooling and fully connected layer
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(512, num_classes)
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def _make_layer(self, in_channels, out_channels, blocks, stride=1):
+        layers = []
+        layers.append(ResidualBlock(in_channels, out_channels, stride))
+        for _ in range(1, blocks):
+            layers.append(ResidualBlock(out_channels, out_channels))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = x.unsqueeze(1)  # Add channel dimension
+        # Initial convolutional layer
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        # Residual blocks
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        # Global average pooling and fully connected layer
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        x = self.dropout(x)
+        return x
+
+class EarlyStopping:
+    """Early stops the training if validation loss doesn't improve after a given patience."""
+    def __init__(self, patience=7, verbose=False, delta=0):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+        self.delta = delta
+
+    def __call__(self, val_loss, model):
+
+        score = -val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        if self.verbose:
+            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
+        torch.save(model.state_dict(), 'checkpoint.pt')
+        self.val_loss_min = val_loss
 
 # Load the CSV file
 data = pd.read_csv('data/raw/appledata.csv')
@@ -37,47 +150,11 @@ y_tensor = torch.tensor(y, dtype=torch.long)
 # Split data into train and test sets
 X_train, X_test, y_train, y_test = train_test_split(X_tensor, y_tensor, test_size=0.2, random_state=42)
 
-# Define the neural network architecture
-class NeuralNetwork(nn.Module):
-    def __init__(self, input_size, hidden_sizes, output_size, dropout_rate=0.2):
-        super(NeuralNetwork, self).__init__()
-        self.input_size = input_size
-        self.hidden_sizes = hidden_sizes
-        self.output_size = output_size
-        self.dropout_rate = dropout_rate
-
-        # Input layer
-        self.fc1 = nn.Linear(input_size, hidden_sizes[0])
-        self.relu1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout_rate)
-
-        # Hidden layers
-        self.hidden_layers = nn.ModuleList()
-        for i in range(len(hidden_sizes) - 1):
-            self.hidden_layers.append(nn.Linear(hidden_sizes[i], hidden_sizes[i + 1]))
-            self.hidden_layers.append(nn.ReLU())
-            self.hidden_layers.append(nn.Dropout(dropout_rate))
-
-        # Output layer
-        self.fc_out = nn.Linear(hidden_sizes[-1], output_size)
-
-    def forward(self, x):
-        out = self.fc1(x)
-        out = self.relu1(out)
-        out = self.dropout1(out)
-
-        for layer in self.hidden_layers:
-            out = layer(out)
-
-        out = self.fc_out(out)
-        return out
-
 # Define hyperparameters
 input_size = X.shape[1]
-hidden_sizes = [128, 64]
-output_size = len(label_encoder.classes_)
+num_classes = len(label_encoder.classes_)
 learning_rate = 0.001
-num_epochs = 20
+num_epochs = 100
 batch_size = 64
 dropout_rate = 0.3
 
@@ -88,12 +165,15 @@ test_dataset = TensorDataset(X_test, y_test)
 test_loader = DataLoader(test_dataset, batch_size=batch_size)
 
 # Initialize the neural network
-model = NeuralNetwork(input_size, hidden_sizes, output_size, dropout_rate)
+model = NeuralNetwork(input_size, num_classes, dropout_rate)
 
 # Define loss function and optimizer
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2, verbose=True)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+
+# Initialize early stopping
+early_stopping = EarlyStopping(patience=20, verbose=True)
 
 # Train the model
 for epoch in range(num_epochs):
@@ -119,10 +199,17 @@ for epoch in range(num_epochs):
     val_loss = val_running_loss / len(test_loader.dataset)
     print(f'Epoch [{epoch + 1}/{num_epochs}], Validation Loss: {val_loss:.4f}')
 
-    # Adjust learning rate based on validation loss
+    # Adjust learning rate based on the scheduler
     scheduler.step(val_loss)
 
+    # Early stopping
+    early_stopping(val_loss, model)
+    if early_stopping.early_stop:
+        print("Early stopping")
+        break
+
 # Evaluate the model
+model.load_state_dict(torch.load('checkpoint.pt'))
 model.eval()
 predictions = []
 true_labels = []
